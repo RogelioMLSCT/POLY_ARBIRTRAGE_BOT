@@ -10,7 +10,6 @@
 // ============================================================
 
 use std::sync::Arc;
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use dashmap::DashMap;
 use chrono::{DateTime, Utc};
@@ -111,6 +110,7 @@ pub struct Market {
 }
 
 impl Market {
+    #[allow(dead_code)]
     /// Suma de precios (debería ser ~1.0 si no hay arbitraje)
     pub fn price_sum(&self) -> f64 {
         self.yes_price + self.no_price
@@ -139,6 +139,7 @@ pub enum MarketStatus {
 /// Un nivel de precio en el order book
 /// Ej: { price: 0.62, size: 500.0 } → hay $500 disponibles a $0.62
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct OrderLevel {
     pub price: f64,
     pub size: f64,
@@ -146,6 +147,7 @@ pub struct OrderLevel {
 
 /// Order book completo de un mercado
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[allow(dead_code)]
 pub struct OrderBook {
     /// Órdenes de compra (bids) para YES, ordenadas de mayor a menor precio
     pub yes_bids: Vec<OrderLevel>,
@@ -317,6 +319,7 @@ pub struct AppState {
 
 /// Estructura del mensaje que llega por WebSocket
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct WsMessage {
     pub event_type: Option<String>,
     pub asset_id: Option<String>,

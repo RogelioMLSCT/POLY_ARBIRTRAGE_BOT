@@ -19,11 +19,10 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn, error, debug};
-use uuid::Uuid;
 
 use crate::types::{
    AppState, BookSnapshot, Market, MarketStatus, 
-    OrderBook, OrderLevel, WsMessage
+    OrderLevel
 };
 
 /// Punto de entrada del módulo feed.

@@ -33,7 +33,7 @@
 use std::collections::VecDeque;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::debug;
 
 // ── Parámetros de VaR ────────────────────────────────────────
 
@@ -110,8 +110,8 @@ pub enum ExecutionType {
 // ── Motor de VaR ─────────────────────────────────────────────
 
 /// Motor central de cálculo de VaR
-/// Mantiene historial de P&L y calcula métricas de riesgo
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct VaREngine {
     /// Historial de P&L (ventana deslizante)
     pnl_history: VecDeque<PnLRecord>,
@@ -376,6 +376,8 @@ impl VaREngine {
                 self.daily_var_limit,
                 self.daily_pnl,
                 self.total_capital,
+                p_full,
+                loss_if_partial,
             ),
         }
     }
@@ -389,24 +391,37 @@ impl VaREngine {
     pub fn check_daily_limit(&self, trade_var: f64) -> DailyLimitCheck {
         let remaining_budget = self.daily_var_limit + self.daily_pnl;
 
-        // Si ya perdimos más del límite hoy, bloquear todo
+        // Regla 1: Ya perdimos más del límite hoy → bloquear todo
         if self.daily_pnl < -self.daily_var_limit {
             return DailyLimitCheck::Blocked {
                 reason: format!(
                     "Límite diario alcanzado. P&L hoy: ${:.2}, límite: ${:.2}",
-                   self.daily_pnl, -self.daily_var_limit
+                    self.daily_pnl, -self.daily_var_limit
                 ),
                 daily_pnl: self.daily_pnl,
                 daily_limit: self.daily_var_limit,
             };
         }
 
-        // Si este trade puede llevar las pérdidas al límite, advertir
+        // Regla 2: El VaR del trade excede el presupuesto restante → bloquear
+        // Ejemplo: quedan $5 de presupuesto, el trade tiene VaR de $10 → bloqueado
+        if trade_var >= remaining_budget {
+            return DailyLimitCheck::Blocked {
+                reason: format!(
+                    "VaR del trade (${:.2}) excede presupuesto restante (${:.2})",
+                    trade_var, remaining_budget
+                ),
+                daily_pnl: self.daily_pnl,
+                daily_limit: self.daily_var_limit,
+            };
+        }
+
+        // Regla 3: El trade consume más del 50% del presupuesto restante → advertir
         if trade_var > remaining_budget * 0.5 {
             return DailyLimitCheck::Warning {
                 message: format!(
                     "Trade consume {:.1}% del presupuesto de riesgo restante",
-                   (trade_var / remaining_budget) * 100.0
+                    (trade_var / remaining_budget) * 100.0
                 ),
                 trade_var,
                 remaining_budget,
@@ -477,6 +492,7 @@ impl VaREngine {
 
 /// Perfil de riesgo de una oportunidad de arbitraje
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct OpportunityRiskProfile {
     pub opportunity_id: String,
     /// Ganancia garantizada si ambas piernas llenan
@@ -595,35 +611,50 @@ fn determine_recommendation(
     daily_var_limit: f64,
     daily_pnl: f64,
     total_capital: f64,
+    fill_probability: f64,
+    worst_case_loss: f64,
 ) -> RiskRecommendation {
     // Regla 1: EV negativo → nunca ejecutar
     if ev <= 0.0 {
         return RiskRecommendation::Skip {
             reason: format!("Expected Value negativo: ${:.4}", ev),
-       };
+        };
     }
 
-    // Regla 2: VaR mayor que la ganancia esperada → riesgo/beneficio negativo
-    if var > profit * 3.0 {
+    // Regla 2: Fill probability muy baja con pérdida alta → Skip
+    // Ejemplo: fill_prob=0.40, worst_case=$0.60, profit=$0.05
+    // Riesgo esperado de pierna = (1-0.40) * 0.50 * 0.60 = $0.18 >> profit=$0.05
+    let expected_partial_loss = (1.0 - fill_probability) * 0.5 * worst_case_loss;
+    if expected_partial_loss > profit * 2.0 {
         return RiskRecommendation::Skip {
             reason: format!(
-                "VaR (${:.4}) excede 3× la ganancia (${:.4})",
-               var, profit
+                "Pérdida esperada por fill parcial (${:.4}) excede 2x ganancia (${:.4}). Fill prob: {:.0}%",
+                expected_partial_loss, profit, fill_probability * 100.0
             ),
         };
     }
 
-    // Regla 3: Ya perdimos demasiado hoy
+    // Regla 3: VaR excede 3x la ganancia garantizada → ratio riesgo/beneficio negativo
+    if var > profit * 3.0 {
+        return RiskRecommendation::Skip {
+            reason: format!(
+                "VaR (${:.4}) excede 3x la ganancia (${:.4})",
+                var, profit
+            ),
+        };
+    }
+
+    // Regla 4: Ya perdimos demasiado hoy (80% del límite diario)
     if daily_pnl < -daily_var_limit * 0.8 {
         return RiskRecommendation::Skip {
             reason: format!(
                 "Límite diario al 80%: P&L hoy = ${:.2}",
-               daily_pnl
+                daily_pnl
             ),
         };
     }
 
-    // Regla 4: VaR excede el 2% del capital total → reducir posición
+    // Regla 5: VaR excede el 2% del capital total → reducir posición
     let var_pct_of_capital = var / total_capital;
     if var_pct_of_capital > 0.02 {
         let suggested_size = 0.02 / var_pct_of_capital;

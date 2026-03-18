@@ -20,11 +20,10 @@
 //    Para cuando g(μ) ≤ (1-α) × D(μ||θ)
 // ============================================================
 
-use std::collections::HashMap;
 use tracing::debug;
 
 /// Un vector de precios de mercado
-/// Cada elemento es el precio de un outcome (entre 0.0 y 1.0)
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PriceVector {
     pub prices: Vec<f64>,
@@ -136,6 +135,7 @@ pub fn update_epsilon(
 
 /// Resultado de una iteración de Frank-Wolfe
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FWResult {
     /// Precios proyectados (μ* aproximado)
     pub projected_prices: Vec<f64>,
@@ -159,10 +159,8 @@ pub struct Vertex {
 }
 
 /// Restricciones del politopo marginal
-/// Para mercado simple YES/NO:
-///   - Σ pᵢ = 1 (exactamente uno es verdadero)
-///   - 0 ≤ pᵢ ≤ 1
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MarketConstraints {
     /// Grupos de outcomes mutuamente excluyentes
     /// Ej: [[YES, NO]] → YES + NO = 1
@@ -253,7 +251,7 @@ pub fn frank_wolfe_project(
     let mut mu: Vec<f64> = interior.clone();
 
     // Conjunto activo inicial (coeficientes de combinación convexa)
-    let mut active_set: Vec<(Vertex, f64)> = vec![(
+    let _active_set: Vec<(Vertex, f64)> = vec![(
         Vertex { values: interior.clone() },
         1.0,
     )];
@@ -384,7 +382,7 @@ fn linear_min_oracle(
 /// Calcula el Frank-Wolfe gap en un punto dado
 fn compute_fw_gap(
     mu: &[f64],
-    theta: &[f64],
+    _theta: &[f64],
     constraints: &MarketConstraints,
     epsilon: f64,
     interior: &[f64],
@@ -402,6 +400,7 @@ fn compute_fw_gap(
 
 /// Resultado del análisis de un par YES/NO
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SimpleArbitrageAnalysis {
     pub market_id: String,
     pub yes_price: f64,
@@ -429,7 +428,7 @@ pub fn analyze_simple_arbitrage(
     min_threshold: f64,
 ) -> SimpleArbitrageAnalysis {
     let price_sum = yes_price + no_price;
-    let deviation = (price_sum - 1.0).abs();
+    let _deviation = (price_sum - 1.0).abs();
 
     let arbitrage_type = if price_sum < 1.0 - min_threshold {
         // Comprar ambos: pagas `price_sum`, recibes $1 → ganancia = 1 - price_sum

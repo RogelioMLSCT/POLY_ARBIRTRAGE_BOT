@@ -27,7 +27,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn, error};
 
 use crate::risk::{VaREngine, ConfidenceLevel};
-use crate::types::{AppState, BotConfig, Market, ArbitrageOpportunity};
+use crate::types::{AppState, BotConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {

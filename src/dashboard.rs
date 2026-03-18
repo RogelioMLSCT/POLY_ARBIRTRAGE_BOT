@@ -17,7 +17,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::{
     extract::State,
-    http::StatusCode,
     response::{Html, IntoResponse, Json},
     routing::get,
     Router,
@@ -25,7 +24,7 @@ use axum::{
 use serde::Serialize;
 use tracing::info;
 
-use crate::types::{AppState, BotStats, Market, ArbitrageOpportunity, ExecutedTrade};
+use crate::types::AppState;
 
 // ── Servidor ─────────────────────────────────────────────────
 
