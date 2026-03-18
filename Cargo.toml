@@ -1,4 +1,3 @@
-
 [package]
 name = "polymarket_bot"
 version = "0.1.0"
@@ -48,6 +47,7 @@ uuid = { version = "1.7", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "5.5"         # HashMap concurrente (thread-safe)
 tokio-util = "0.7"
+dotenvy = "0.15"        # Cargar variables desde archivo .env
 
 # --- Crypto (firmar transacciones) ---
 sha2 = "0.10"

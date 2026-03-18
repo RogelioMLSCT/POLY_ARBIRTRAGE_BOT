@@ -2,300 +2,406 @@
 // feed.rs — Conexión WebSocket en tiempo real con Polymarket
 // ============================================================
 //
-// Este módulo:
-// 1. Se conecta al WebSocket de Polymarket
-// 2. Se suscribe a updates de precios
-// 3. Actualiza el estado compartido (AppState) con cada mensaje
+// CORRECCIONES APLICADAS:
 //
-// WebSocket = conexión persistente bidireccional.
-// En vez de hacer polling ("¿hay algo nuevo?"), el servidor
-// te EMPUJA los datos cuando cambian. Latencia ~5ms vs ~50ms.
+// 1. La API pública de Polymarket NO requiere autenticación
+//    para leer mercados. Solo para ejecutar órdenes.
+//
+// 2. El WebSocket de Polymarket usa "asset_ids" (token IDs),
+//    NO condition_ids. Son diferentes:
+//      condition_id = ID del mercado (ej: "0xabc...")
+//      asset_id     = ID del token YES o NO (ej: "123456789")
+//
+// 3. El formato correcto de suscripción es:
+//    { "assets_ids": ["token_id_1", "token_id_2"], "type": "market" }
+//
+// 4. Sin API key, el bot ahora obtiene mercados reales de la
+//    API pública sin autenticación.
 // ============================================================
 
 use std::sync::Arc;
+use std::collections::HashMap;
 use anyhow::{Result, Context};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use serde_json::json;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn, error, debug};
 
-use crate::types::{
-   AppState, BookSnapshot, Market, MarketStatus, 
-    OrderLevel
-};
+use crate::types::{AppState, BookSnapshot, Market, MarketStatus, OrderLevel};
 
-/// Punto de entrada del módulo feed.
-/// Se llama desde main.rs y corre indefinidamente.
+// ── Estructuras para parsear la API de Polymarket ────────────
+
+#[derive(Debug, Deserialize)]
+struct MarketsResponse {
+    data: Option<Vec<MarketData>>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MarketData {
+    condition_id: Option<String>,
+    question: Option<String>,
+    tokens: Option<Vec<TokenData>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenData {
+    token_id: String,
+    outcome: String,
+    price: Option<f64>,
+}
+
+/// Información que guardamos por cada token
+#[derive(Debug, Clone)]
+pub struct TokenInfo {
+    pub condition_id: String,
+    pub outcome: String,
+    pub question: String,
+}
+
+// ── Entry point ───────────────────────────────────────────────
+
 pub async fn run(state: Arc<AppState>) -> Result<()> {
     info!("Iniciando feed de datos de Polymarket...");
 
-   // Loop de reconexión automática
-    // Si la conexión se cae, espera 5 segundos y vuelve a conectar
     loop {
         match connect_and_stream(Arc::clone(&state)).await {
             Ok(_) => {
-                warn!("WebSocket cerrado normalmente, reconectando...");
-           }
+                warn!("WebSocket cerrado normalmente, reconectando en 5s...");
+            }
             Err(e) => {
-                error!("Error en WebSocket: {}. Reconectando en 5s...", e);
-           }
+                error!("Error en feed: {}. Reconectando en 5s...", e);
+            }
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     }
 }
 
 async fn connect_and_stream(state: Arc<AppState>) -> Result<()> {
-    let ws_url = &state.config.ws_url;
-    info!("Conectando a {}", ws_url);
+    // ── Paso 1: Obtener mercados via REST API publica ─────────
+    info!("Obteniendo mercados activos de Polymarket...");
+    let (token_ids, token_map) = fetch_markets_and_tokens(&state).await?;
 
-   // Establecer conexión WebSocket
-    // `connect_async` retorna (websocket_stream, http_response)
+    if token_ids.is_empty() {
+        warn!("No se obtuvieron tokens. Reintentando en 5s...");
+        return Ok(());
+    }
+
+    info!("{} tokens listos para monitorear", token_ids.len());
+
+    // ── Paso 2: Conectar WebSocket ────────────────────────────
+    let ws_url = &state.config.ws_url;
+    info!("Conectando WebSocket a {}", ws_url);
+
     let (mut ws_stream, _) = connect_async(ws_url)
         .await
-        .context("Falló conexión WebSocket")?;
+        .context("Fallo conexion WebSocket")?;
 
-   info!("Conectado al WebSocket de Polymarket");
+    info!("Conectado al WebSocket de Polymarket");
 
-   // ── Suscripción a mercados ───────────────────────────────
-    // Primero necesitamos obtener los mercados activos via API REST
-    // y luego suscribirnos a sus condition_ids
-    let market_ids = fetch_active_markets(&state).await?;
-    info!("{} mercados activos encontrados", market_ids.len());
+    // ── Paso 3: Suscribirse a tokens en lotes de 100 ─────────
+    // Polymarket tiene límite de suscripciones simultáneas.
+    // En dry_run usamos solo los primeros 200 tokens para no saturar.
+    let tokens_to_use: Vec<String> = if state.config.dry_run {
+        token_ids.into_iter().take(200).collect()
+    } else {
+        token_ids
+    };
 
-   // Enviar mensaje de suscripción al WebSocket
-    // Formato específico del protocolo de Polymarket
-    let subscribe_msg = json!({
-        "auth": {},
-       "type": "market",
-       "assets_ids": market_ids.iter().take(100).collect::<Vec<_>>(), // Max 100 por suscripción
-    });
+    let chunks: Vec<Vec<String>> = tokens_to_use.chunks(50).map(|c| c.to_vec()).collect();
 
-    ws_stream
-        .send(Message::Text(subscribe_msg.to_string()))
-        .await
-        .context("Falló envío de suscripción")?;
+    for (i, chunk) in chunks.iter().enumerate() {
+        let subscribe_msg = json!({
+            "assets_ids": chunk,
+            "type": "market"
+        });
 
-   info!("Suscripcion enviada para {} mercados", market_ids.len().min(100));
+        ws_stream
+            .send(Message::Text(subscribe_msg.to_string()))
+            .await
+            .context("Fallo envio de suscripcion")?;
 
-   // ── Loop principal de recepción de mensajes ──────────────
+        // Pequeño delay entre lotes para no saturar el servidor
+        if i < chunks.len() - 1 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    info!("Suscrito a {} tokens en {} lotes", tokens_to_use.len(), chunks.len());
+
+    // ── Paso 4: Loop de recepcion de mensajes ─────────────────
+    let mut msg_count = 0u64;
+
     while let Some(msg) = ws_stream.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                // Intentar parsear el mensaje JSON
+                msg_count += 1;
+                if msg_count % 500 == 1 {
+                    debug!("Mensajes recibidos: {}", msg_count);
+                }
+
                 match serde_json::from_str::<serde_json::Value>(&text) {
-                    Ok(json) => {
-                        if let Err(e) = process_message(&state, json).await {
+                    Ok(json_val) => {
+                        if let Err(e) = process_message(&state, json_val, &token_map).await {
                             debug!("Error procesando mensaje: {}", e);
-                       }
+                        }
                     }
                     Err(e) => {
-                        debug!("JSON inválido recibido: {} - {}", e, &text[..text.len().min(100)]);
-                   }
+                        debug!("JSON invalido: {} | {}", e, &text[..text.len().min(80)]);
+                    }
                 }
             }
             Ok(Message::Ping(payload)) => {
-                // Responder pings para mantener la conexión viva
                 ws_stream.send(Message::Pong(payload)).await?;
             }
             Ok(Message::Close(_)) => {
-                info!("Servidor cerró la conexión WebSocket");
-               break;
+                info!("Servidor cerro la conexion WebSocket");
+                break;
             }
             Err(e) => {
                 error!("Error recibiendo mensaje: {}", e);
-               break;
+                break;
             }
-            _ => {} // Ignorar otros tipos de mensajes (Binary, etc.)
+            _ => {}
         }
     }
 
     Ok(())
 }
 
-/// Procesa un mensaje del WebSocket y actualiza el estado
-async fn process_message(state: &Arc<AppState>, json: serde_json::Value) -> Result<()> {
-    // Polymarket envía diferentes tipos de mensajes
-    let msg_type = json.get("event_type")
-       .or_else(|| json.get("type"))
-       .and_then(|v| v.as_str())
+// ── Procesamiento de mensajes ─────────────────────────────────
+
+async fn process_message(
+    state: &Arc<AppState>,
+    json_val: serde_json::Value,
+    token_map: &HashMap<String, TokenInfo>,
+) -> Result<()> {
+    // Polymarket puede enviar array de eventos o un objeto unico
+    if let Some(arr) = json_val.as_array() {
+        for item in arr {
+            process_single_event(state, item, token_map).await;
+        }
+    } else {
+        process_single_event(state, &json_val, token_map).await;
+    }
+    Ok(())
+}
+
+async fn process_single_event(
+    state: &Arc<AppState>,
+    event: &serde_json::Value,
+    token_map: &HashMap<String, TokenInfo>,
+) {
+    let event_type = event.get("event_type")
+        .or_else(|| event.get("type"))
+        .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
-   match msg_type {
-        // Book snapshot = estado completo del order book
+    match event_type {
         "book" => {
-           if let Ok(snapshot) = serde_json::from_value::<BookSnapshot>(json) {
-                update_order_book(state, snapshot).await;
+            if let Ok(snapshot) = serde_json::from_value::<BookSnapshot>(event.clone()) {
+                update_from_book_snapshot(state, &snapshot, token_map).await;
             }
         }
-
-        // Price change = una orden se ejecutó, los precios cambiaron
-        "price_change" | "tick_size_change" => {
-           if let Some(asset_id) = json.get("asset_id").and_then(|v| v.as_str()) {
-               if let Some(price) = json.get("price").and_then(|v| v.as_f64()) {
-                   update_market_price(state, asset_id, price).await;
-                }
+        "price_change" | "last_trade_price" => {
+            if let (Some(asset_id), Some(price)) = (
+                event.get("asset_id").and_then(|v| v.as_str()),
+                event.get("price").and_then(|v| v.as_f64()),
+            ) {
+                update_price_from_token(state, asset_id, price, token_map).await;
             }
         }
-
-        // Market info = metadatos del mercado (nombre, estado, etc.)
-        "market" | "last_trade_price" => {
-           update_market_from_json(state, &json).await;
-        }
-
         _ => {
-            debug!("Tipo de mensaje desconocido: {}", msg_type);
-       }
+            debug!("Evento: {}", event_type);
+        }
     }
-
-    Ok(())
 }
 
-/// Actualiza el order book de un mercado con un snapshot completo
-async fn update_order_book(state: &Arc<AppState>, snapshot: BookSnapshot) {
-    let asset_id = snapshot.asset_id.clone();
+// ── Actualizacion del estado ──────────────────────────────────
 
-    // Parsear los niveles del order book
-    // Formato: [["0.62", "500.00"], ["0.61", "250.00"], ...]
-   let parse_levels = |levels: Vec<[String; 2]>| -> Vec<OrderLevel> {
-        levels.into_iter()
-            .filter_map(|[price_str, size_str]| {
-                let price = price_str.parse::<f64>().ok()?;
-                let size = size_str.parse::<f64>().ok()?;
-                Some(OrderLevel { price, size })
+async fn update_from_book_snapshot(
+    state: &Arc<AppState>,
+    snapshot: &BookSnapshot,
+    token_map: &HashMap<String, TokenInfo>,
+) {
+    let parse_levels = |levels: &Vec<[String; 2]>| -> Vec<OrderLevel> {
+        levels.iter()
+            .filter_map(|[p, s]| {
+                Some(OrderLevel {
+                    price: p.parse().ok()?,
+                    size:  s.parse().ok()?,
+                })
             })
             .collect()
     };
 
-    let mut bids = parse_levels(snapshot.bids);
-    let mut asks = parse_levels(snapshot.asks);
+    let mut bids = parse_levels(&snapshot.bids);
+    let mut asks = parse_levels(&snapshot.asks);
 
-    // Ordenar: bids de mayor a menor, asks de menor a mayor
     bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
     asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Precio mid (mejor bid + mejor ask) / 2
     let mid_price = match (bids.first(), asks.first()) {
         (Some(bid), Some(ask)) => (bid.price + ask.price) / 2.0,
         (Some(bid), None) => bid.price,
         (None, Some(ask)) => ask.price,
-        (None, None) => return, // Sin datos, ignorar
+        (None, None) => return,
     };
 
-    // Actualizar o crear el mercado en el estado
-    state.markets.entry(asset_id.clone())
-        .and_modify(|market| {
-            // Actualizar precios existentes
-            // En Polymarket, YES y NO son tokens separados con asset_ids diferentes
-            // Por simplificación, aquí asumimos que este es el token YES
-            market.yes_price = mid_price;
-            market.last_updated = Utc::now();
-        })
-        .or_insert_with(|| {
-            // Crear nuevo mercado si no existe
-            Market {
-                condition_id: asset_id.clone(),
-                question: format!("Market {}", &asset_id[..8.min(asset_id.len())]),
-               yes_price: mid_price,
-                no_price: 1.0 - mid_price,  // Estimación inicial
-                yes_volume: asks.iter().map(|l| l.size).sum(),
-                no_volume: 0.0,
-                last_updated: Utc::now(),
-                status: MarketStatus::Active,
-            }
-        });
+    let volume: f64 = asks.iter().map(|l| l.size).sum();
 
-    debug!("Order book actualizado: {} @ {:.3}", &asset_id[..8], mid_price);
+    update_price_from_token(state, &snapshot.asset_id, mid_price, token_map).await;
+
+    if let Some(info) = token_map.get(&snapshot.asset_id) {
+        if let Some(mut market) = state.markets.get_mut(&info.condition_id) {
+            match info.outcome.to_lowercase().as_str() {
+                "yes" => market.yes_volume = volume,
+                "no"  => market.no_volume  = volume,
+                _ => {}
+            }
+        }
+    }
 }
 
-/// Actualiza solo el precio de un mercado
-async fn update_market_price(state: &Arc<AppState>, asset_id: &str, price: f64) {
-   if let Some(mut market) = state.markets.get_mut(asset_id) {
-        market.yes_price = price;
-        market.no_price = 1.0 - price; // Actualizar NO también
+async fn update_price_from_token(
+    state: &Arc<AppState>,
+    asset_id: &str,
+    price: f64,
+    token_map: &HashMap<String, TokenInfo>,
+) {
+    let info = match token_map.get(asset_id) {
+        Some(i) => i,
+        None => return,
+    };
+
+    if let Some(mut market) = state.markets.get_mut(&info.condition_id) {
+        match info.outcome.to_lowercase().as_str() {
+            "yes" => market.yes_price = price,
+            "no"  => market.no_price  = price,
+            _ => {}
+        }
         market.last_updated = Utc::now();
     }
 }
 
-/// Actualiza información del mercado desde JSON genérico
-async fn update_market_from_json(state: &Arc<AppState>, json: &serde_json::Value) {
-    let condition_id = match json.get("condition_id")
-       .or_else(|| json.get("market"))
-       .and_then(|v| v.as_str()) {
-        Some(id) => id.to_string(),
-        None => return,
-    };
+// ── Obtener mercados de la API publica ────────────────────────
 
-    let question = json.get("question")
-       .or_else(|| json.get("description"))
-       .and_then(|v| v.as_str())
-        .unwrap_or("Unknown Market")
-       .to_string();
-
-    state.markets.entry(condition_id.clone())
-        .and_modify(|m| {
-            m.question = question.clone();
-            m.last_updated = Utc::now();
-        })
-        .or_insert_with(|| Market {
-            condition_id: condition_id.clone(),
-            question,
-            yes_price: 0.5,
-            no_price: 0.5,
-            yes_volume: 0.0,
-            no_volume: 0.0,
-            last_updated: Utc::now(),
-            status: MarketStatus::Active,
-        });
-}
-
-/// Obtiene la lista de mercados activos via API REST
-/// En producción real, paginería y filtraría por criterios
-async fn fetch_active_markets(state: &Arc<AppState>) -> Result<Vec<String>> {
+async fn fetch_markets_and_tokens(
+    state: &Arc<AppState>,
+) -> Result<(Vec<String>, HashMap<String, TokenInfo>)> {
     let api_url = &state.config.api_url;
-    let markets_url = format!("{}/markets?active=true&closed=false", api_url);
 
-   info!(" Obteniendo mercados activos de {}", markets_url);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("polymarket-bot/0.1")
+        .build()
+        .context("Error creando cliente HTTP")?;
 
-   // En modo dry_run o sin API key, retorna mercados de ejemplo
-    if state.config.api_key.is_empty() {
-        warn!("Sin API key — usando mercados de ejemplo para testing");
-       return Ok(example_market_ids());
+    let mut all_token_ids: Vec<String> = Vec::new();
+    let mut token_map: HashMap<String, TokenInfo> = HashMap::new();
+    let mut cursor = String::new();
+    let mut page = 0;
+
+    loop {
+        page += 1;
+
+        let url = if cursor.is_empty() {
+            format!("{}/markets?active=true&closed=false&limit=100", api_url)
+        } else {
+            format!("{}/markets?active=true&closed=false&limit=100&next_cursor={}", api_url, cursor)
+        };
+
+        let response = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Error HTTP pagina {}: {}", page, e);
+                break;
+            }
+        };
+
+        if !response.status().is_success() {
+            warn!("API status {} en pagina {}", response.status(), page);
+            break;
+        }
+
+        let markets_resp: MarketsResponse = match response.json().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Error parseando mercados: {}", e);
+                break;
+            }
+        };
+
+        let markets = match markets_resp.data {
+            Some(m) if !m.is_empty() => m,
+            _ => break,
+        };
+
+        for market in &markets {
+            let condition_id = match &market.condition_id {
+                Some(id) => id.clone(),
+                None => continue,
+            };
+
+            let question = market.question
+                .clone()
+                .unwrap_or_else(|| "Sin nombre".to_string());
+
+            if let Some(tokens) = &market.tokens {
+                for token in tokens {
+                    all_token_ids.push(token.token_id.clone());
+                    token_map.insert(token.token_id.clone(), TokenInfo {
+                        condition_id: condition_id.clone(),
+                        outcome: token.outcome.clone(),
+                        question: question.clone(),
+                    });
+
+                    // Guardar precio inicial si la API lo provee
+                    if let Some(price) = token.price {
+                        state.markets.entry(condition_id.clone())
+                            .and_modify(|m| {
+                                match token.outcome.to_lowercase().as_str() {
+                                    "yes" => m.yes_price = price,
+                                    "no"  => m.no_price  = price,
+                                    _ => {}
+                                }
+                                m.last_updated = Utc::now();
+                            })
+                            .or_insert_with(|| Market {
+                                condition_id: condition_id.clone(),
+                                question: question.clone(),
+                                yes_price: if token.outcome.to_lowercase() == "yes" { price } else { 0.5 },
+                                no_price:  if token.outcome.to_lowercase() == "no"  { price } else { 0.5 },
+                                yes_volume: 0.0,
+                                no_volume: 0.0,
+                                last_updated: Utc::now(),
+                                status: MarketStatus::Active,
+                            });
+                    }
+                }
+            }
+        }
+
+        info!("Pagina {}: {} mercados | {} tokens total",
+              page, markets.len(), all_token_ids.len());
+
+        // Limitar a 200 tokens en dry_run (100 mercados aprox)
+        // para no saturar el WebSocket con demasiadas suscripciones
+        if state.config.dry_run && all_token_ids.len() >= 200 {
+            info!("DRY_RUN: limitando a {} tokens (100 mercados)", all_token_ids.len());
+            break;
+        }
+
+        match markets_resp.next_cursor {
+            Some(c) if !c.is_empty() && c != "LTE=" => cursor = c,
+            _ => break,
+        }
     }
 
-    let client = reqwest::Client::new();
-    let response = client
-        .get(&markets_url)
-        .header("Authorization", format!("Bearer {}", state.config.api_key))
-       .send()
-        .await
-        .context("Falló request a API de Polymarket")?;
+    info!("Total cargado: {} tokens de {} mercados",
+          all_token_ids.len(), token_map.len() / 2.max(1));
 
-   let json: serde_json::Value = response.json().await?;
-
-    // Extraer los condition_ids del JSON de respuesta
-    let ids: Vec<String> = json
-        .get("data")
-       .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m.get("condition_id")?.as_str())
-               .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
-
-    info!("{} mercados obtenidos de la API", ids.len());
-   Ok(ids)
-}
-
-/// Mercados de ejemplo para testing sin API key real
-fn example_market_ids() -> Vec<String> {
-    // Estos son condition_ids reales de Polymarket (elecciones 2024)
-    // Para testing local
-    vec![
-        "0xtest_market_1".to_string(),
-       "0xtest_market_2".to_string(),
-       "0xtest_market_3".to_string(),
-    ]
+    Ok((all_token_ids, token_map))
 }

@@ -1,1 +1,13 @@
+# ============================================================
+# .gitignore - Archivos que NO se suben a GitHub
+# ============================================================
+
+.env
+.env.real
+
+# Carpeta de compilación 
 /target
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db

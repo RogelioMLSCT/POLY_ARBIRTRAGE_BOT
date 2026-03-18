@@ -31,9 +31,13 @@ use crate::types::{AppState, BotConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-   tracing_subscriber::fmt()
+    // Cargar variables del archivo .env si existe
+    // Si no existe, continua con las variables del sistema operativo
+    dotenvy::dotenv().ok();
+
+    tracing_subscriber::fmt()
         .with_env_filter("polymarket_bot=info,warn")
-       .init();
+        .init();
 
     info!("Iniciando Polymarket Arbitrage Bot");
 
