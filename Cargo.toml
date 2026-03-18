@@ -1,0 +1,60 @@
+
+[package]
+name = "polymarket_bot"
+version = "0.1.0"
+edition = "2021"
+
+# ============================================================
+# DEPENDENCIAS EXPLICADAS:
+# tokio      → Runtime async (para manejar muchas cosas a la vez sin bloquear)
+# tungstenite → Cliente WebSocket (conexión en tiempo real con Polymarket)
+# reqwest    → Cliente HTTP (para hacer órdenes via API REST)
+# serde      → Serialización JSON (convertir JSON ↔ structs de Rust)
+# tracing    → Logging profesional (ver qué hace el bot en tiempo real)
+# nalgebra   → Álgebra lineal (vectores/matrices para Frank-Wolfe)
+# axum       → Servidor web (para el dashboard de monitoreo)
+# ============================================================
+
+[dependencies]
+# --- Async Runtime ---
+tokio = { version = "1.36", features = ["full"] }
+
+# --- WebSocket (feed en tiempo real de Polymarket) ---
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+
+# --- HTTP Client (ejecutar órdenes) ---
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+
+# --- JSON Serialización/Deserialización ---
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# --- Logging ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- Matemáticas (vectores para Frank-Wolfe) ---
+nalgebra = "0.32"
+
+# --- Servidor Web para Dashboard ---
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+tokio-stream = "0.1"
+
+# --- Utilidades ---
+anyhow = "1.0"          # Manejo de errores ergonómico
+uuid = { version = "1.7", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+dashmap = "5.5"         # HashMap concurrente (thread-safe)
+tokio-util = "0.7"
+
+# --- Crypto (firmar transacciones) ---
+sha2 = "0.10"
+hex = "0.4"
+
+[profile.release]
+# Optimizaciones máximas para producción
+opt-level = 3
+lto = true
+codegen-units = 1
